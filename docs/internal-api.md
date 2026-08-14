@@ -21,22 +21,45 @@ backend는 AI 기능을 **포트(인터페이스)** 로 두고 `mock` / `http` �
 | `BackgroundRemover` | 누끼 | `POST /cutout` |
 | `Recommender` | DNA·추천 | `POST /style-dna`, `POST /recommend` |
 | `OutfitComposer` | 코디 후보 | `POST /outfits` |
-| `LookImageGenerator` | 룩 이미지 1장 | `POST /looks/image` |
+| `OutfitImageGenerator` | 코디 화보 1장 | `POST /outfits/image` |
 
 ## 엔드포인트 초안
 
 ```
-POST /vision/tag     (image)                  → {category, color, material, mood}
-POST /cutout         (image)                  → {cutoutImage | url}          # rembg
+POST /cutout         (multipart image)        → image/png 바이너리 (투명 배경)   # rembg ✅ 구현됨
+POST /vision/standardize (image)              → image/png 바이너리 (상품컷)      # ✅ 구현됨 — billing 키 대기 ★스캔 품질의 핵심
+POST /vision/tag     (image)                  → {category, color, material, mood} # ✅ 구현됨 — vocab을 응답 스키마 enum으로 강제
+POST /outfits/image  (multipart images[])     → image/png 바이너리 (flat-lay 화보) # ✅ 구현됨 — 코디 후보마다 1장, 실측 14~31s
 POST /style-dna      {items:[...]}            → {summary, dominantColors, dominantMoods, keywords}
 POST /recommend      {items:[...]}            → {bestPick, more:[...]}       # 후보 id 제안
 POST /outfits        {moodId, closet, seed?}  → [{closetItemIds, mcmProductId, reason}, ...]
-POST /looks/image    {items, mcm}             → {imageUrl}                   # Gemini, 저장 시 1장만
 ```
+
+### 스캔 파이프라인 — `/standardize`가 품질의 핵심
+
+사용자는 옷을 **대충 찍는다**(입은 채로, 침대 위에서). 참고앱(Dress AI)은 이런 사진을 **쇼핑몰 상품컷으로 재생성**한다 — 배경 제거가 아니라 생성형 이미지 모델의 몫이다.
+
+```
+사용자 사진 → ① /standardize (Gemini 재생성: 옷걸이에 걸린 정면 상품컷)
+           → ② /cutout (rembg: 흰 배경 제거 → 투명 PNG)
+           → ③ /vision/tag
+```
+
+- ①이 없으면 ②만으로 폴백 가능(구겨진 채 누끼) — 동작은 하지만 품질이 확 떨어진다.
+- 재생성 특성상 디테일 오류(반바지→긴바지, 프린트 글자 변형)가 생길 수 있다 — UX상 재스캔으로 흡수(계약에 이미 있음).
+- **Gemini 키 확보 후 1순위 스파이크가 이 프롬프트다** (룩 이미지 생성보다 먼저 — 스캔은 모든 옷이 거치는 관문).
+
+### `/cutout` — 구현·검증 완료 (2026-08-13)
+
+- 입력: multipart `image` (jpg/png) · 출력: **`image/png` 바이너리**(투명 배경) · 실패 시 `422`
+- URL 반환이 아니라 바이너리로 확정 — 저장은 backend(StorageService)가 담당하므로 AI 서비스는 무상태.
+- 실측(CPU, 2000px 상품컷): **평균 1.74초/장**, 모델 로드는 시작 시 1회(~11초). Gemini와 무관, API 키 불필요.
 
 ### 태그 값은 고정 vocabulary를 지켜야 함
 
 `POST /vision/tag` 응답은 아래 값 중 하나여야 한다. **여기서 벗어난 값이 오면 backend가 저장하지 못한다.**
+구현은 프롬프트 준수에 기대지 않고 **Gemini structured output의 응답 스키마에 vocab을 enum으로 강제**한다
+(+ 서비스에서 이중 검증 — 벗어나면 502). Gemini 키가 없으면 `/vision/*`만 503, `/cutout`은 정상.
 
 ```
 category : 상의 | 하의 | 아우터 | 원피스 | 신발 | 가방 | 악세서리
@@ -59,14 +82,17 @@ mood     : 미니멀 | 캐주얼 | 클래식 | 스트릿 | 페미닌 | 럭셔리
 - 후보는 **최대 3개**. 재료가 부족하면 1~2개여도 된다.
 - `seed`(= `seedMcmProductId`)가 오면 그 제품을 고정한 채 조합한다.
 
-### `/looks/image` 는 느려도 된다
+### `/outfits/image` — 코디 화보 (후보마다 1장)
 
-backend가 **비동기로 호출**한다. 사용자는 저장 완료 화면을 먼저 보고, 이미지는 준비되면 교체된다.
-수십 초 걸려도 UX가 깨지지 않으니 **속도보다 품질** 우선.
+- 입력: multipart `images` 여러 장(아이템 누끼들, MCM 포함) · 출력: **image/png 바이너리**(flat-lay 연출컷)
+- backend가 **코디 후보(§공개계약 4-4)마다 병렬 호출**한다 — 실측 14~31초/장. 저장(4-5)은 후보 화보를 재사용하므로 재호출 없음.
+- 프롬프트는 17회 실측 후 동결(장문은 환각·변형 실패, 단문 채택) — 조정은 팀 시연 결과 기반으로만.
+- 이미지 없이 텍스트만 반환하는 비결정성 대비 1회 재시도 내장. 그래도 실패면 502 — backend는 해당 후보만 imageUrl=null 처리.
 
 ## 열린 항목
 
 - Gemini API 키·모델명·쿼터 확정
-- `/cutout` 응답을 **바이너리로 줄지 URL로 줄지** — backend가 저장을 담당하므로 바이너리가 단순할 수 있음
+- ~~`/cutout` 응답 바이너리 vs URL~~ → **바이너리로 확정** (backend가 저장 담당, AI 서비스는 무상태)
 - 이미지 입력 형식·최대 크기 (jpg/png, iPhone HEIC 변환은 프론트가 처리)
-- MCM 상품 누끼는 **backend 시드 적재 시** 처리 예정 — AI 서비스의 `/cutout`을 재사용할지 별도로 돌릴지
+- 사용자 폰 사진(복잡한 배경) 누끼 품질 확인 — 현재 검증은 흰 배경 상품컷 기준
+- MCM 상품 누끼는 **backend 시드 적재 시** 이 `/cutout`을 호출해 처리
