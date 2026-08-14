@@ -8,8 +8,8 @@ AI 서비스 (Python FastAPI). **backend만 호출하는 내부 API** — 외부
 | 비전 태깅 `POST /vision/tag` | ✅ 구현·검증됨 | Gemini 2.5 Flash (**무료 티어 가능**, vocab을 응답 스키마 enum으로 강제) |
 | 스캔 표준화 `POST /vision/standardize` | ✅ 구현됨 — **billing 키 대기** | Gemini 이미지 생성 (무료 할당 0) |
 | 코디 화보 `POST /outfits/image` | ✅ 구현·검증됨 | Gemini 이미지 생성 (동결 프롬프트, 14~31s/장) |
-| 스타일 DNA·추천 `/style-dna` `/recommend` | 예정 | Gemini |
-| 코디 조합 `/outfits` | 예정 | Gemini |
+| 스타일 DNA·추천 `POST /style-dna` `POST /recommend` | ✅ 구현·검증됨 | Gemini 텍스트 (무료 티어 가능, 스키마 강제) |
+| 코디 조합 `POST /outfits` | ✅ 구현·검증됨 | Gemini 텍스트 (무드→Context 매핑, concept 영어 작명) |
 
 API 정의 → [`docs/internal-api.md`](docs/internal-api.md)
 

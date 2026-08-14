@@ -23,6 +23,7 @@ from fastapi.responses import Response
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from pydantic import BaseModel
 from rembg import new_session, remove
 
 load_dotenv()
@@ -30,6 +31,7 @@ load_dotenv()
 logger = logging.getLogger("uvicorn")
 
 TAG_MODEL = os.environ.get("GEMINI_TAG_MODEL", "gemini-2.5-flash")
+TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 # 고정 vocabulary — docs/api-v1.md 공통 타입. 여기서 벗어나면 backend가 저장하지 못한다.
@@ -259,6 +261,200 @@ def vision_standardize(image: UploadFile = File(...)):
     except genai_errors.APIError as e:
         logger.exception("standardize failed for %s", image.filename)
         raise HTTPException(status_code=502, detail=f"gemini: {e.message}")
+
+
+# ---------------------------------------------------------------------------
+# 텍스트 LLM — 스타일 DNA·MCM 추천·코디 조합 (프롬프트 리서치의 Style DNA+Context 설계 반영)
+# id는 backend가 DB 재검증하므로 환각 id가 섞여도 앱은 안 깨진다 — 그래도 스키마·프롬프트로 이중 방어.
+# ---------------------------------------------------------------------------
+
+
+class AiItem(BaseModel):
+    id: int
+    category: str
+    color: str
+    material: str
+    mood: str
+
+
+class AiProductIn(BaseModel):
+    id: int
+    name: str
+    category: str
+    color: str
+    material: str
+
+
+class StyleDnaRequest(BaseModel):
+    items: list[AiItem]
+
+
+class RecommendRequest(BaseModel):
+    items: list[AiItem]
+    products: list[AiProductIn]
+
+
+class OutfitsRequest(BaseModel):
+    mood: str
+    items: list[AiItem]
+    products: list[AiProductIn]
+
+
+# 무드별 사전 정의 Context — LLM이 키워드↔태그의 의미 관계를 해석해 매칭한다
+CONTEXTS = {
+    "저녁 약속": "세련된, 깔끔한, 적당한 격식, 과하게 포멀하지 않은",
+    "출근": "단정한, 프로페셔널한, 깔끔한, 신뢰감 있는",
+    "출장": "단정한, 전문적인, 편안한, 이동하기 좋은",
+    "데일리": "편안한, 자연스러운, 실용적인, 캐주얼한",
+    "주말 산책": "편안한, 활동적인, 자연스러운, 여유로운",
+    "파티": "화려한, 눈에 띄는, 개성 있는, 드레시한",
+}
+
+DNA_PROMPT = (
+    "당신은 패션 스타일 분석가입니다. 사용자 옷장 아이템들의 태그 분포를 해석해 스타일 DNA를 만드세요.\n"
+    "- summary: 사용자의 취향을 한국어 한 문장으로 요약 — 색과 무드의 경향을 자연스럽게 서술\n"
+    "- dominantColors: 옷장에서 지배적인 색 1~2개 (후보 중에서만)\n"
+    "- dominantMoods: 지배적인 무드 1~2개 (후보 중에서만)\n"
+    "- keywords: 사용자 스타일을 표현하는 한국어 키워드 3개\n"
+    "빈도만 세지 말고 아이템 간 조합과 경향을 해석하세요."
+)
+
+RECOMMEND_PROMPT = (
+    "당신은 MCM 제품을 추천하는 AI 스타일 큐레이터입니다. "
+    "사용자 옷장 아이템의 태그로 취향을 해석하고, 후보 MCM 제품 중 어울리는 것을 골라 추천하세요.\n"
+    "1. 단순 태그 일치가 아니라 색상·소재·무드의 조화를 종합 판단하세요.\n"
+    "2. 사용자 취향과 이어지는 제품을 우선하되, 취향을 한 단계 확장하는 제품도 포함하세요.\n"
+    "3. 제공된 후보 목록의 id만 사용하세요 — 목록에 없는 제품을 만들지 마세요.\n"
+    "4. reason은 한국어 한 문장 — 이 옷장과 왜 어울리는지 구체적으로.\n"
+    "5. pairsWithItemIds: 함께 입으면 좋은 옷장 아이템 id 최대 2개.\n"
+    "가장 추천하는 순서로 최대 5개."
+)
+
+OUTFITS_PROMPT = (
+    "당신은 사용자의 실제 옷장과 MCM 제품을 함께 활용해 상황에 맞는 개인화 코디를 제안하는 AI 스타일 큐레이터입니다.\n"
+    "[상황] {mood} — Context: {context}\n"
+    "[스타일링 기준]\n"
+    "1. 가장 먼저 상황과 Context에 적합한 코디인지 판단하세요.\n"
+    "2. 그 범위 안에서 옷장 태그가 보여주는 사용자 취향을 반영하세요.\n"
+    "3. 사용자 보유 아이템을 코디의 중심으로 하고, 각 코디에 MCM 제품을 정확히 1개 포함하세요.\n"
+    "4. MCM 제품은 단순히 추가하지 말고 기존 옷과 조화되며 스타일을 확장하는 것으로 선택하세요.\n"
+    "5. 색상, 소재, 무드, 격식도와 아이템 간 조화를 종합적으로 고려하세요.\n"
+    "6. 카테고리와 착용 역할을 고려해 실제 착용 가능한 완성된 코디를 구성하세요 — 같은 역할의 아이템을 중복 선택하지 마세요.\n"
+    "7. 제공된 id만 사용하세요 — 목록에 없는 아이템이나 제품을 만들지 마세요.\n"
+    "8. 서로 다른 코디 3개를 제안하세요. 옷 조합이 다르면 같은 MCM 제품을 써도 다른 코디입니다. "
+    "재료가 정말 부족할 때만 1~2개로 줄이세요.\n"
+    "9. concept: 코디 컨셉명을 영어 2~3단어로 지으세요 (예: Refined Minimal).\n"
+    "10. reason: 한국어 1~2문장 — 상황 적합성, 반영한 취향, MCM 제품이 더한 요소를 담으세요."
+)
+
+DNA_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "summary": types.Schema(type=types.Type.STRING),
+        "dominantColors": types.Schema(
+            type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING, enum=COLORS)),
+        "dominantMoods": types.Schema(
+            type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING, enum=MOODS)),
+        "keywords": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING)),
+    },
+    required=["summary", "dominantColors", "dominantMoods", "keywords"],
+)
+
+RECOMMEND_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "picks": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "productId": types.Schema(type=types.Type.INTEGER),
+                    "reason": types.Schema(type=types.Type.STRING),
+                    "pairsWithItemIds": types.Schema(
+                        type=types.Type.ARRAY, items=types.Schema(type=types.Type.INTEGER)),
+                },
+                required=["productId", "reason", "pairsWithItemIds"],
+            ),
+        )
+    },
+    required=["picks"],
+)
+
+OUTFITS_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "looks": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "concept": types.Schema(type=types.Type.STRING),
+                    "closetItemIds": types.Schema(
+                        type=types.Type.ARRAY, items=types.Schema(type=types.Type.INTEGER)),
+                    "mcmProductId": types.Schema(type=types.Type.INTEGER),
+                    "reason": types.Schema(type=types.Type.STRING),
+                },
+                required=["concept", "closetItemIds", "mcmProductId", "reason"],
+            ),
+        )
+    },
+    required=["looks"],
+)
+
+
+def _text_llm(prompt: str, payload: dict, schema: types.Schema) -> dict:
+    client = _gemini(app)
+    try:
+        t0 = time.time()
+        resp = client.models.generate_content(
+            model=TEXT_MODEL,
+            contents=[prompt, json.dumps(payload, ensure_ascii=False)],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", response_schema=schema),
+        )
+        result = json.loads(resp.text)
+        logger.info("text llm ok in %.1fs", time.time() - t0)
+        return result
+    except genai_errors.APIError as e:
+        logger.exception("text llm failed")
+        raise HTTPException(status_code=502, detail=f"gemini: {e.message}")
+    except (json.JSONDecodeError, ValueError):
+        logger.exception("text llm parse failed")
+        raise HTTPException(status_code=502, detail="gemini returned non-JSON response")
+
+
+@app.post("/style-dna")
+def style_dna(req: StyleDnaRequest):
+    """스타일 DNA — 옷장 태그 분포를 LLM이 해석. 응답 형태는 backend Recommender 포트와 1:1."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="empty items")
+    return _text_llm(DNA_PROMPT, {"items": [i.model_dump() for i in req.items]}, DNA_SCHEMA)
+
+
+@app.post("/recommend")
+def recommend(req: RecommendRequest):
+    """MCM 추천 — 옷장 취향 해석 후 후보 상품 중 최대 5개 (첫 번째가 bestPick)."""
+    if not req.items or not req.products:
+        raise HTTPException(status_code=400, detail="empty items or products")
+    payload = {
+        "items": [i.model_dump() for i in req.items],
+        "products": [p.model_dump() for p in req.products],
+    }
+    return _text_llm(RECOMMEND_PROMPT, payload, RECOMMEND_SCHEMA)
+
+
+@app.post("/outfits")
+def outfits(req: OutfitsRequest):
+    """코디 조합 — 상황 Context + 옷장 + MCM을 해석해 서로 다른 코디 최대 3개 (concept 영어 작명)."""
+    if not req.products:
+        raise HTTPException(status_code=400, detail="empty products")
+    prompt = OUTFITS_PROMPT.format(
+        mood=req.mood, context=CONTEXTS.get(req.mood, "상황에 자연스럽게 어울리는"))
+    payload = {
+        "items": [i.model_dump() for i in req.items],
+        "products": [p.model_dump() for p in req.products],
+    }
+    return _text_llm(prompt, payload, OUTFITS_SCHEMA)
 
 
 @app.post("/outfits/image")
