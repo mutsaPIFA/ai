@@ -113,7 +113,7 @@ TAG_SCHEMA = types.Schema(
 OUTFIT_PROMPT = (
     "첨부한 옷들을 한 장의 사진으로 연출해 줘.\n"
     "- 패션 매거진 스타일의 flat-lay: 옷들을 바닥에 자연스럽게 배치해 위에서 촬영한 구도\n"
-    "- 각 아이템이 서로를 가리지 않고 전체 형태가 모두 보이게 배치하되, 넓은 여백 없이 화면을 균형 있게 꽉 채울 것\n"
+    "- 각 아이템이 서로를 가리지 않고 전체 형태가 모두 보이게, 위아래 방향을 바르게(옆으로 눕히지 말 것) 배치하되, 넓은 여백 없이 화면을 균형 있게 꽉 채울 것\n"
     "- 첨부한 아이템은 하나도 빠짐없이 모두 포함하고, 새로운 옷·신발·가방·시계·안경 등 어떤 것도 추가하지 말 것\n"
     "- 각 아이템의 색상, 프린트, 형태, 카라·단추 같은 세부 디자인을 원본 그대로 유지할 것\n"
     "- 옷에 걸린 옷걸이는 지우고 옷만 표현할 것\n"
@@ -461,7 +461,8 @@ def outfits(req: OutfitsRequest):
 def outfit_image(images: list[UploadFile] = File(...)):
     """코디 화보 — 아이템 누끼 여러 장 → flat-lay 연출컷 1장 (image/png 바이너리).
 
-    실측: 4벌 기준 14~31초/장. 이미지 없이 텍스트만 반환하는 비결정성 대비 1회 재시도.
+    실측: 4벌 기준 14~31초/장. 이미지 없이 텍스트만 반환하는 비결정성(2연속 실측) 대비 최대 2회 재시도 —
+    재시도부터는 "이미지로만 응답" 지시를 덧붙인다(첫 시도 프롬프트는 동결 유지).
     """
     client = _gemini(app)
     parts: list = [OUTFIT_PROMPT]
@@ -470,10 +471,12 @@ def outfit_image(images: list[UploadFile] = File(...)):
         parts.append(types.Part.from_bytes(data=data, mime_type=_sniff_mime(data)))
     if len(parts) < 3:  # 프롬프트 + 최소 2벌
         raise HTTPException(status_code=400, detail="need at least 2 images")
+    image_only_nudge = "텍스트 설명 없이, 완성된 flat-lay 이미지 한 장으로만 응답하세요."
     try:
         t0 = time.time()
-        for attempt in (1, 2):
-            resp = client.models.generate_content(model=IMAGE_MODEL, contents=parts)
+        for attempt in (1, 2, 3):
+            contents = parts if attempt == 1 else parts + [image_only_nudge]
+            resp = client.models.generate_content(model=IMAGE_MODEL, contents=contents)
             cand_parts = resp.candidates[0].content.parts if resp.candidates else []
             for p in cand_parts or []:
                 if p.inline_data:
