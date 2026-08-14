@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+rembg>=2.0.66
+onnxruntime>=1.18
+google-genai>=1.0
+python-dotenv>=1.0
