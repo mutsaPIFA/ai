@@ -30,10 +30,13 @@ POST /cutout         (multipart image)        → image/png 바이너리 (투명
 POST /vision/standardize (image)              → image/png 바이너리 (상품컷)      # ✅ 구현됨 — billing 키 대기 ★스캔 품질의 핵심
 POST /vision/tag     (image)                  → {category, color, material, mood} # ✅ 구현됨 — vocab을 응답 스키마 enum으로 강제
 POST /outfits/image  (multipart images[])     → image/png 바이너리 (flat-lay 화보) # ✅ 구현됨 — 코디 후보마다 1장, 실측 14~31s
-POST /style-dna      {items:[...]}            → {summary, dominantColors, dominantMoods, keywords}
-POST /recommend      {items:[...]}            → {bestPick, more:[...]}       # 후보 id 제안
-POST /outfits        {moodId, closet, seed?}  → [{closetItemIds, mcmProductId, reason}, ...]
+POST /style-dna      {items}                  → {summary, dominantColors, dominantMoods, keywords} # ✅ 구현됨 — 텍스트 LLM, enum 스키마 강제
+POST /recommend      {items, products}        → {picks:[{productId, reason, pairsWithItemIds}]}    # ✅ 구현됨 — 최대 5, 첫 번째가 bestPick
+POST /outfits        {mood, items, products}  → {looks:[{concept, closetItemIds, mcmProductId, reason}]} # ✅ 구현됨 — 상황 Context 매핑 내장, concept=영어 작명
 ```
+
+- 텍스트 LLM 3종은 프롬프트 리서치의 **Style DNA + Context 설계**를 반영: 무드 라벨→Context 키워드 매핑을 서비스가 보유(6종), LLM이 키워드↔태그의 의미 관계를 해석해 조합. 태그 체계 확장(Style/Silhouette 등 5축)은 v2 백로그.
+- id는 backend가 DB 재검증하고, LLM 실패 시 backend가 룰베이스로 런타임 폴백한다 — 이 서비스는 품질만 책임지면 된다.
 
 ### 스캔 파이프라인 — `/standardize`가 품질의 핵심
 
