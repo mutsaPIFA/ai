@@ -1,0 +1,27 @@
+# main 푸시 = 서버 자동 배포 (SSH → /srv/mcmmuse/deploy.sh)
+# dev 는 개발 통합 브랜치 — 배포하려면 dev → main 머지.
+# backend·ai·frontend 세 레포에 같은 워크플로가 있고, 어느 쪽 main이 바뀌어도
+# deploy.sh 가 세 레포를 모두 pull 하므로 결과는 동일하다.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mcmmuse-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH 배포
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 root@1.201.116.164 'bash /srv/mcmmuse/deploy.sh'
